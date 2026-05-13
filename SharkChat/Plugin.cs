@@ -87,16 +87,26 @@ public sealed unsafe class Plugin : IDalamudPlugin
             try
             {
                 var original = message->ToString();
+                Log.Debug($"[SharkChat] Hook fired — original: '{original}'");
+
                 var modified = Substitutor.Apply(original, Configuration.Rules);
 
                 if (!string.Equals(modified, original, StringComparison.Ordinal))
                 {
-                    var bytes = Encoding.UTF8.GetBytes(modified + '\0');
+                    Log.Debug($"[SharkChat] Sending modified: '{modified}'");
+
+                    // Ctor() initialises the inline buffer and internal fields —
+                    // skipping it leaves the struct zeroed and SetString() may
+                    // write to a null pointer, silently producing no output.
                     Utf8String modifiedStr = default;
+                    modifiedStr.Ctor();
+
+                    var bytes = Encoding.UTF8.GetBytes(modified + '\0');
                     fixed (byte* ptr = bytes)
                     {
                         modifiedStr.SetString(ptr);
                     }
+
                     _hook!.Original(uiModule, &modifiedStr, a3, saveToHistory);
                     modifiedStr.Dtor();
                     return;
