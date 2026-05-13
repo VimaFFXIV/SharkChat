@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using Dalamud.Game.Command;
@@ -26,17 +27,16 @@ public sealed unsafe class Plugin : IDalamudPlugin
     public Configuration Configuration { get; init; }
 
     // ── Hook 1 : RaptureShellModule.ProcessLine ───────────────────────────────
-    // Fires for explicit /commands (confirmed working for /tell in v1.0.4).
-    // Using nint for the module pointer so the delegate does not require
-    // RaptureShellModule to be visible — the address is resolved at runtime via
-    // MemberFunctionPointers and the calling convention is identical.
+    // ProcessLine fires for all explicit /commands (/tell confirmed in v1.0.4).
+    // We resolve the address via reflection so the code compiles against any
+    // Dalamud reference assembly — the type only needs to exist at runtime.
     private delegate void ProcessLineDelegate(nint module, byte* text, ulong length);
     private readonly Hook<ProcessLineDelegate>? _processLineHook;
 
     // ── Hook 2 : UIModule.ProcessChatBoxEntry ─────────────────────────────────
-    // Fires for channel-mode messages (say/fc/shout/yell typed without '/').
-    // v1.0.6 proved this does NOT fire for those channels; kept here with an
-    // unconditional diagnostic log so we have complete evidence in /xllog.
+    // Kept with an unconditional diagnostic log; v1.0.6 confirmed it does NOT
+    // fire for channel-mode messages, so it acts as a safety net for any path
+    // that does reach it.
     private delegate void ProcessChatBoxEntryDelegate(
         UIModule* uiModule, Utf8String* message, nint a3, bool saveToHistory);
     private readonly Hook<ProcessChatBoxEntryDelegate>? _chatBoxHook;
@@ -48,26 +48,30 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
-        // ── Hook 1 ────────────────────────────────────────────────────────────
+        // ── Hook 1 — ProcessLine (reflection address lookup) ──────────────────
         try
         {
-            // Access the address through the fully-qualified nested type to
-            // avoid an ambiguous-reference compile error while still letting
-            // the CI build succeed against whichever Dalamud is current.
-            var addr = (nint)FFXIVClientStructs.FFXIV.Client.UI.RaptureShellModule
-                             .MemberFunctionPointers.ProcessLine;
-            Log.Debug($"[SharkChat] ProcessLine address: 0x{addr:X}");
-            _processLineHook = GameInterop.HookFromAddress<ProcessLineDelegate>(
-                addr, ProcessLineDetour);
-            _processLineHook.Enable();
-            Log.Information("[SharkChat] ProcessLine hook enabled.");
+            var addr = ResolveProcessLineAddress();
+            if (addr.HasValue && addr.Value != 0)
+            {
+                Log.Debug($"[SharkChat] ProcessLine address (reflection): 0x{addr.Value:X}");
+                _processLineHook = GameInterop.HookFromAddress<ProcessLineDelegate>(
+                    addr.Value, ProcessLineDetour);
+                _processLineHook.Enable();
+                Log.Information("[SharkChat] ProcessLine hook enabled.");
+            }
+            else
+            {
+                Log.Warning("[SharkChat] RaptureShellModule.ProcessLine not found via " +
+                            "reflection — /tell substitutions will not work.");
+            }
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "[SharkChat] Failed to hook RaptureShellModule.ProcessLine.");
+            Log.Error(ex, "[SharkChat] Failed to hook ProcessLine.");
         }
 
-        // ── Hook 2 ────────────────────────────────────────────────────────────
+        // ── Hook 2 — ProcessChatBoxEntry ──────────────────────────────────────
         try
         {
             var addr = (nint)UIModule.MemberFunctionPointers.ProcessChatBoxEntry;
@@ -79,7 +83,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "[SharkChat] Failed to hook UIModule.ProcessChatBoxEntry.");
+            Log.Error(ex, "[SharkChat] Failed to hook ProcessChatBoxEntry.");
         }
 
         if (_processLineHook == null && _chatBoxHook == null)
@@ -101,6 +105,45 @@ public sealed unsafe class Plugin : IDalamudPlugin
         });
     }
 
+    /// <summary>
+    /// Walks all loaded assemblies looking for
+    /// <c>FFXIVClientStructs.FFXIV.Client.UI.RaptureShellModule.MemberFunctionPointers.ProcessLine</c>
+    /// as either a static property or a static field returning <see cref="nint"/>.
+    /// Returns <c>null</c> when the type is absent (e.g. in some Dalamud builds).
+    /// </summary>
+    private static nint? ResolveProcessLineAddress()
+    {
+        const string typeName = "FFXIVClientStructs.FFXIV.Client.UI.RaptureShellModule";
+        const string mfpName  = "MemberFunctionPointers";
+        const string fnName   = "ProcessLine";
+
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            var rsm = asm.GetType(typeName);
+            if (rsm == null) continue;
+
+            var mfp = rsm.GetNestedType(mfpName,
+                BindingFlags.Public | BindingFlags.NonPublic);
+            if (mfp == null) break;
+
+            // Try property first (source-generated FFXIVClientStructs ≥ v2).
+            var prop = mfp.GetProperty(fnName,
+                BindingFlags.Public | BindingFlags.Static);
+            if (prop?.GetValue(null) is nint pa && pa != 0)
+                return pa;
+
+            // Fall back to field (older generated output).
+            var field = mfp.GetField(fnName,
+                BindingFlags.Public | BindingFlags.Static);
+            if (field?.GetValue(null) is nint fa && fa != 0)
+                return fa;
+
+            break; // found the type, but couldn't read the address
+        }
+
+        return null;
+    }
+
     public void Dispose()
     {
         CommandManager.RemoveHandler(Command);
@@ -119,32 +162,38 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void ProcessLineDetour(nint module, byte* text, ulong length)
     {
-        // UNCONDITIONAL — visible in /xllog for every single invocation.
+        // UNCONDITIONAL — appears in /xllog for every invocation.
         Log.Debug($"[SharkChat] ProcessLine fired — len={length}");
 
-        if (Configuration.Enabled && text != null && length > 0 && Configuration.Rules.Count > 0)
+        if (Configuration.Enabled && text != null && Configuration.Rules.Count > 0)
         {
             try
             {
-                var original = Marshal.PtrToStringUTF8((nint)text, (int)length) ?? string.Empty;
-                Log.Debug($"[SharkChat] ProcessLine — original: '{original}'");
+                // Accept both length-prefixed and null-terminated strings.
+                var original = length > 0
+                    ? (Marshal.PtrToStringUTF8((nint)text, (int)length) ?? string.Empty)
+                    : (Marshal.PtrToStringUTF8((nint)text) ?? string.Empty);
 
-                var modified = Substitutor.Apply(original, Configuration.Rules);
-
-                if (!string.Equals(modified, original, StringComparison.Ordinal))
+                if (!string.IsNullOrEmpty(original))
                 {
-                    Log.Debug($"[SharkChat] ProcessLine — sending modified: '{modified}'");
-                    var bytes = Encoding.UTF8.GetBytes(modified);
-                    fixed (byte* ptr = bytes)
+                    Log.Debug($"[SharkChat] ProcessLine — original: '{original}'");
+                    var modified = Substitutor.Apply(original, Configuration.Rules);
+
+                    if (!string.Equals(modified, original, StringComparison.Ordinal))
                     {
-                        _processLineHook!.Original(module, ptr, (ulong)bytes.Length);
+                        Log.Debug($"[SharkChat] ProcessLine — modified: '{modified}'");
+                        var bytes = Encoding.UTF8.GetBytes(modified);
+                        fixed (byte* ptr = bytes)
+                        {
+                            _processLineHook!.Original(module, ptr, (ulong)bytes.Length);
+                        }
+                        return;
                     }
-                    return;
                 }
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "[SharkChat] ProcessLine — error applying substitutions.");
+                Log.Error(ex, "[SharkChat] ProcessLine error.");
             }
         }
 
@@ -156,7 +205,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private void ProcessChatBoxEntryDetour(
         UIModule* uiModule, Utf8String* message, nint a3, bool saveToHistory)
     {
-        // UNCONDITIONAL — visible in /xllog for every single invocation.
+        // UNCONDITIONAL — appears in /xllog for every invocation.
         Log.Debug("[SharkChat] ProcessChatBoxEntry fired");
 
         if (Configuration.Enabled && message != null && Configuration.Rules.Count > 0)
@@ -170,7 +219,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
                 if (!string.Equals(modified, original, StringComparison.Ordinal))
                 {
-                    Log.Debug($"[SharkChat] ProcessChatBoxEntry — sending modified: '{modified}'");
+                    Log.Debug($"[SharkChat] ProcessChatBoxEntry — modified: '{modified}'");
 
                     Utf8String modifiedStr = default;
                     modifiedStr.Ctor();
@@ -186,7 +235,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "[SharkChat] ProcessChatBoxEntry — error applying substitutions.");
+                Log.Error(ex, "[SharkChat] ProcessChatBoxEntry error.");
             }
         }
 
