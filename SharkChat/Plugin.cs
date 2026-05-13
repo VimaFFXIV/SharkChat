@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.InteropServices;
 using System.Text;
 using Dalamud.Game.Command;
 using Dalamud.Hooking;
@@ -24,13 +25,22 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     public Configuration Configuration { get; init; }
 
-    // UIModule.ProcessChatBoxEntry is the function the chat-box UI calls when the
-    // player presses Enter.  It fires for channel-mode messages (say/fc/shout/yell
-    // typed without a leading '/') as well as explicit /commands like /tell.
+    // ── Hook 1 : RaptureShellModule.ProcessLine ───────────────────────────────
+    // Fires for explicit /commands (confirmed working for /tell in v1.0.4).
+    // Using nint for the module pointer so the delegate does not require
+    // RaptureShellModule to be visible — the address is resolved at runtime via
+    // MemberFunctionPointers and the calling convention is identical.
+    private delegate void ProcessLineDelegate(nint module, byte* text, ulong length);
+    private readonly Hook<ProcessLineDelegate>? _processLineHook;
+
+    // ── Hook 2 : UIModule.ProcessChatBoxEntry ─────────────────────────────────
+    // Fires for channel-mode messages (say/fc/shout/yell typed without '/').
+    // v1.0.6 proved this does NOT fire for those channels; kept here with an
+    // unconditional diagnostic log so we have complete evidence in /xllog.
     private delegate void ProcessChatBoxEntryDelegate(
         UIModule* uiModule, Utf8String* message, nint a3, bool saveToHistory);
+    private readonly Hook<ProcessChatBoxEntryDelegate>? _chatBoxHook;
 
-    private readonly Hook<ProcessChatBoxEntryDelegate>? _hook;
     private readonly WindowSystem _windowSystem = new("SharkChat");
     private readonly MainWindow   _mainWindow;
 
@@ -38,20 +48,44 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
+        // ── Hook 1 ────────────────────────────────────────────────────────────
+        try
+        {
+            // Access the address through the fully-qualified nested type to
+            // avoid an ambiguous-reference compile error while still letting
+            // the CI build succeed against whichever Dalamud is current.
+            var addr = (nint)FFXIVClientStructs.FFXIV.Client.UI.RaptureShellModule
+                             .MemberFunctionPointers.ProcessLine;
+            Log.Debug($"[SharkChat] ProcessLine address: 0x{addr:X}");
+            _processLineHook = GameInterop.HookFromAddress<ProcessLineDelegate>(
+                addr, ProcessLineDetour);
+            _processLineHook.Enable();
+            Log.Information("[SharkChat] ProcessLine hook enabled.");
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "[SharkChat] Failed to hook RaptureShellModule.ProcessLine.");
+        }
+
+        // ── Hook 2 ────────────────────────────────────────────────────────────
         try
         {
             var addr = (nint)UIModule.MemberFunctionPointers.ProcessChatBoxEntry;
             Log.Debug($"[SharkChat] ProcessChatBoxEntry address: 0x{addr:X}");
-            _hook = GameInterop.HookFromAddress<ProcessChatBoxEntryDelegate>(
+            _chatBoxHook = GameInterop.HookFromAddress<ProcessChatBoxEntryDelegate>(
                 addr, ProcessChatBoxEntryDetour);
-            _hook.Enable();
+            _chatBoxHook.Enable();
             Log.Information("[SharkChat] ProcessChatBoxEntry hook enabled.");
         }
         catch (Exception ex)
         {
             Log.Error(ex, "[SharkChat] Failed to hook UIModule.ProcessChatBoxEntry.");
+        }
+
+        if (_processLineHook == null && _chatBoxHook == null)
+        {
             ChatGui.PrintError(
-                "[SharkChat] Could not hook into chat — substitutions will not work. " +
+                "[SharkChat] No chat hooks could be loaded — substitutions will not work. " +
                 "Check /xllog for details.");
         }
 
@@ -74,53 +108,89 @@ public sealed unsafe class Plugin : IDalamudPlugin
         PluginInterface.UiBuilder.Draw         -= _windowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= _mainWindow.Toggle;
 
-        _hook?.Disable();
-        _hook?.Dispose();
+        _processLineHook?.Disable();
+        _processLineHook?.Dispose();
+
+        _chatBoxHook?.Disable();
+        _chatBoxHook?.Dispose();
     }
 
-    // ── Hook detour ───────────────────────────────────────────────────────────
+    // ── Hook 1 detour ─────────────────────────────────────────────────────────
+
+    private void ProcessLineDetour(nint module, byte* text, ulong length)
+    {
+        // UNCONDITIONAL — visible in /xllog for every single invocation.
+        Log.Debug($"[SharkChat] ProcessLine fired — len={length}");
+
+        if (Configuration.Enabled && text != null && length > 0 && Configuration.Rules.Count > 0)
+        {
+            try
+            {
+                var original = Marshal.PtrToStringUTF8((nint)text, (int)length) ?? string.Empty;
+                Log.Debug($"[SharkChat] ProcessLine — original: '{original}'");
+
+                var modified = Substitutor.Apply(original, Configuration.Rules);
+
+                if (!string.Equals(modified, original, StringComparison.Ordinal))
+                {
+                    Log.Debug($"[SharkChat] ProcessLine — sending modified: '{modified}'");
+                    var bytes = Encoding.UTF8.GetBytes(modified);
+                    fixed (byte* ptr = bytes)
+                    {
+                        _processLineHook!.Original(module, ptr, (ulong)bytes.Length);
+                    }
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[SharkChat] ProcessLine — error applying substitutions.");
+            }
+        }
+
+        _processLineHook!.Original(module, text, length);
+    }
+
+    // ── Hook 2 detour ─────────────────────────────────────────────────────────
 
     private void ProcessChatBoxEntryDetour(
         UIModule* uiModule, Utf8String* message, nint a3, bool saveToHistory)
     {
-        // Unconditional — fires before any guard so we can see every invocation
-        // in /xllog regardless of whether rules are configured or enabled.
-        Log.Debug("[SharkChat] ProcessChatBoxEntry detour called");
+        // UNCONDITIONAL — visible in /xllog for every single invocation.
+        Log.Debug("[SharkChat] ProcessChatBoxEntry fired");
 
         if (Configuration.Enabled && message != null && Configuration.Rules.Count > 0)
         {
             try
             {
                 var original = message->ToString();
-                Log.Debug($"[SharkChat] Original: '{original}'");
+                Log.Debug($"[SharkChat] ProcessChatBoxEntry — original: '{original}'");
 
                 var modified = Substitutor.Apply(original, Configuration.Rules);
 
                 if (!string.Equals(modified, original, StringComparison.Ordinal))
                 {
-                    Log.Debug($"[SharkChat] Sending modified: '{modified}'");
+                    Log.Debug($"[SharkChat] ProcessChatBoxEntry — sending modified: '{modified}'");
 
                     Utf8String modifiedStr = default;
                     modifiedStr.Ctor();
-
                     var bytes = Encoding.UTF8.GetBytes(modified + '\0');
                     fixed (byte* ptr = bytes)
                     {
                         modifiedStr.SetString(ptr);
                     }
-
-                    _hook!.Original(uiModule, &modifiedStr, a3, saveToHistory);
+                    _chatBoxHook!.Original(uiModule, &modifiedStr, a3, saveToHistory);
                     modifiedStr.Dtor();
                     return;
                 }
             }
             catch (Exception ex)
             {
-                Log.Error(ex, "[SharkChat] Error applying substitutions.");
+                Log.Error(ex, "[SharkChat] ProcessChatBoxEntry — error applying substitutions.");
             }
         }
 
-        _hook!.Original(uiModule, message, a3, saveToHistory);
+        _chatBoxHook!.Original(uiModule, message, a3, saveToHistory);
     }
 
     // ── Command ───────────────────────────────────────────────────────────────
