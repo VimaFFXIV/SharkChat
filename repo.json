@@ -1,0 +1,30 @@
+[
+  {
+    "Author": "VimaFFXIV",
+    "Name": "SharkChat",
+    "InternalName": "SharkChat",
+    "AssemblyVersion": "1.0.0.0",
+    "TestingAssemblyVersion": null,
+    "Punchline": "Auto-replace words in your outgoing chat messages.",
+    "Description": "SharkChat intercepts your chat before it's sent and swaps words or phrases for whatever you want.\n\nSet up rules like Thanks → Thankies, and they'll apply automatically every time you chat — across any channel.\n\nFeatures:\n• Whole-word matching (so \"tank\" won't mangle \"thanks\")\n• Case-insensitive by default\n• Per-rule enable/disable\n• Live preview so you can test rules before using them\n\nCommands:\n/shark — toggle on/off\n/shark config — open settings",
+    "Changelog": null,
+    "Tags": ["chat", "autocorrect", "word replace", "fun", "utility"],
+    "CategoryTags": null,
+    "IsHide": false,
+    "IsTestingExclusive": false,
+    "RepoUrl": "https://github.com/VimaFFXIV/SharkChat",
+    "ApplicableVersion": "any",
+    "DalamudApiLevel": 15,
+    "TestingDalamudApiLevel": 0,
+    "DownloadCount": 0,
+    "LastUpdate": 1746230400,
+    "DownloadLinkInstall": "https://github.com/VimaFFXIV/SharkChat/releases/latest/download/latest.zip",
+    "DownloadLinkTesting": "https://github.com/VimaFFXIV/SharkChat/releases/latest/download/latest.zip",
+    "DownloadLinkUpdate": "https://github.com/VimaFFXIV/SharkChat/releases/latest/download/latest.zip",
+    "LoadPriority": 0,
+    "ImageUrls": null,
+    "IconUrl": null,
+    "AcceptsFeedback": false,
+    "FeedbackMessage": null
+  }
+]

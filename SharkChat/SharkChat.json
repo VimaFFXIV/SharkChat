@@ -1,0 +1,16 @@
+{
+  "Author": "VimaFFXIV",
+  "Name": "SharkChat",
+  "InternalName": "SharkChat",
+  "AssemblyVersion": "1.0.0.0",
+  "Punchline": "Auto-replace words in your outgoing chat messages.",
+  "Description": "SharkChat intercepts your chat before it's sent and swaps words or phrases for whatever you want.\n\nSet up rules like Thanks → Thankies, and they'll apply automatically every time you chat — across any channel.\n\nFeatures:\n• Whole-word matching (so \"tank\" won't mangle \"thanks\")\n• Case-insensitive by default\n• Per-rule enable/disable\n• Live preview so you can test rules before using them\n\nCommands:\n/shark — toggle on/off\n/shark config — open settings",
+  "ApplicableVersion": "any",
+  "Tags": [
+    "chat",
+    "autocorrect",
+    "word replace",
+    "fun",
+    "utility"
+  ]
+}
