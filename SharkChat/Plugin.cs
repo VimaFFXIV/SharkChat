@@ -16,12 +16,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
 {
     private const string Command = "/shark";
 
-    // ProcessChatBox — the game function that receives and dispatches all typed
-    // chat input. Signature valid for FFXIV 7.x / Dalamud API 15.
-    // If this stops working after a patch, update the signature here.
-    private const string ProcessChatBoxSig =
-        "48 89 5C 24 ?? 57 48 83 EC 20 48 8B FA 48 8B D9 45 84 C9";
-
     [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
     [PluginService] internal static ICommandManager         CommandManager  { get; private set; } = null!;
     [PluginService] internal static IChatGui                ChatGui         { get; private set; } = null!;
@@ -30,10 +24,14 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     public Configuration Configuration { get; init; }
 
-    private delegate void ProcessChatBoxDelegate(
-        UIModule* uiModule, Utf8String* message, nint unused, byte a4);
+    // In FFXIV 7.5 the function was renamed ProcessChatBoxEntry and the last
+    // parameter changed from byte to bool. Using MemberFunctionPointers means
+    // the address is resolved by FFXIVClientStructs at runtime, so it survives
+    // future patches automatically as long as FFXIVClientStructs is updated.
+    private delegate void ProcessChatBoxEntryDelegate(
+        UIModule* uiModule, Utf8String* message, nint a3, bool saveToHistory);
 
-    private readonly Hook<ProcessChatBoxDelegate>? _hook;
+    private readonly Hook<ProcessChatBoxEntryDelegate>? _hook;
     private readonly WindowSystem _windowSystem = new("SharkChat");
     private readonly MainWindow   _mainWindow;
 
@@ -41,18 +39,16 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
-        // Hook the chat-send function.
         try
         {
-            _hook = GameInterop.HookFromSignature<ProcessChatBoxDelegate>(
-                ProcessChatBoxSig, ProcessChatBoxDetour);
+            _hook = GameInterop.HookFromAddress<ProcessChatBoxEntryDelegate>(
+                (nint)UIModule.MemberFunctionPointers.ProcessChatBoxEntry,
+                ProcessChatBoxEntryDetour);
             _hook.Enable();
         }
         catch (Exception ex)
         {
-            Log.Error(ex,
-                "[SharkChat] Failed to hook ProcessChatBox. " +
-                "The signature may need updating for this patch.");
+            Log.Error(ex, "[SharkChat] Failed to hook ProcessChatBoxEntry.");
             ChatGui.PrintError(
                 "[SharkChat] Could not hook into chat — substitutions will not work. " +
                 "Check /xllog for details.");
@@ -61,7 +57,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         _mainWindow = new MainWindow(Configuration);
         _windowSystem.AddWindow(_mainWindow);
 
-        PluginInterface.UiBuilder.Draw        += _windowSystem.Draw;
+        PluginInterface.UiBuilder.Draw         += _windowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi += _mainWindow.Toggle;
 
         CommandManager.AddHandler(Command, new CommandInfo(OnCommand)
@@ -74,7 +70,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         CommandManager.RemoveHandler(Command);
 
-        PluginInterface.UiBuilder.Draw        -= _windowSystem.Draw;
+        PluginInterface.UiBuilder.Draw         -= _windowSystem.Draw;
         PluginInterface.UiBuilder.OpenConfigUi -= _mainWindow.Toggle;
 
         _hook?.Disable();
@@ -83,8 +79,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     // ── Hook detour ───────────────────────────────────────────────────────────
 
-    private void ProcessChatBoxDetour(
-        UIModule* uiModule, Utf8String* message, nint unused, byte a4)
+    private void ProcessChatBoxEntryDetour(
+        UIModule* uiModule, Utf8String* message, nint a3, bool saveToHistory)
     {
         if (Configuration.Enabled && message != null && Configuration.Rules.Count > 0)
         {
@@ -95,15 +91,13 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
                 if (!string.Equals(modified, original, StringComparison.Ordinal))
                 {
-                    // Stack-allocate a new Utf8String for the modified text and
-                    // pass that to the original function instead.
                     var bytes = Encoding.UTF8.GetBytes(modified + '\0');
                     Utf8String modifiedStr = default;
                     fixed (byte* ptr = bytes)
                     {
                         modifiedStr.SetString(ptr);
                     }
-                    _hook!.Original(uiModule, &modifiedStr, unused, a4);
+                    _hook!.Original(uiModule, &modifiedStr, a3, saveToHistory);
                     modifiedStr.Dtor();
                     return;
                 }
@@ -114,7 +108,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
             }
         }
 
-        _hook!.Original(uiModule, message, unused, a4);
+        _hook!.Original(uiModule, message, a3, saveToHistory);
     }
 
     // ── Command ───────────────────────────────────────────────────────────────
@@ -129,7 +123,6 @@ public sealed unsafe class Plugin : IDalamudPlugin
             return;
         }
 
-        // No args — toggle master switch
         Configuration.Enabled = !Configuration.Enabled;
         Configuration.Save();
         ChatGui.Print(Configuration.Enabled
