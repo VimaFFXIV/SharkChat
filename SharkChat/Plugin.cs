@@ -12,7 +12,7 @@ using SharkChat.Windows;
 
 namespace SharkChat;
 
-public sealed class Plugin : IDalamudPlugin
+public sealed unsafe class Plugin : IDalamudPlugin
 {
     private const string Command = "/shark";
 
@@ -30,7 +30,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public Configuration Configuration { get; init; }
 
-    private unsafe delegate void ProcessChatBoxDelegate(
+    private delegate void ProcessChatBoxDelegate(
         UIModule* uiModule, Utf8String* message, nint unused, byte a4);
 
     private readonly Hook<ProcessChatBoxDelegate>? _hook;
@@ -83,7 +83,7 @@ public sealed class Plugin : IDalamudPlugin
 
     // ── Hook detour ───────────────────────────────────────────────────────────
 
-    private unsafe void ProcessChatBoxDetour(
+    private void ProcessChatBoxDetour(
         UIModule* uiModule, Utf8String* message, nint unused, byte a4)
     {
         if (Configuration.Enabled && message != null && Configuration.Rules.Count > 0)
